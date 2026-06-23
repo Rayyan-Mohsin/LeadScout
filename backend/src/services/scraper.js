@@ -56,7 +56,7 @@ async function collectListingLinks(browser, query) {
   } catch {
     return [];
   } finally {
-    await page.close();
+    await page.close().catch(() => null);
   }
 }
 
@@ -69,7 +69,7 @@ async function scrapeListingDetail(browser, listing) {
     await page.waitForSelector("h1", { timeout: 10000 }).catch(() => null);
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    return page.evaluate(() => {
+    const detail = await page.evaluate(() => {
       const name = document.querySelector("h1")?.textContent?.trim() || "";
       const category = document.querySelector('button[jsaction*="category"]')?.textContent?.trim();
       const addressEl = document.querySelector('button[data-item-id="address"]');
@@ -84,10 +84,12 @@ async function scrapeListingDetail(browser, listing) {
         hasWebsite: !!websiteEl,
       };
     });
+
+    return detail;
   } catch {
     return null;
   } finally {
-    await page.close();
+    await page.close().catch(() => null);
   }
 }
 
@@ -116,23 +118,27 @@ export async function findBusinessesWithoutWebsite(location) {
     await Promise.all(
       uniqueListings.map((listing) =>
         limit(async () => {
-          if (leads.length >= MAX_TOTAL_LEADS) return;
+          try {
+            if (leads.length >= MAX_TOTAL_LEADS) return;
 
-          const coords = extractCoordsFromHref(listing.href);
-          if (!coords) return;
+            const coords = extractCoordsFromHref(listing.href);
+            if (!coords) return;
 
-          const detail = await scrapeListingDetail(browser, listing);
-          if (!detail || detail.hasWebsite) return;
+            const detail = await scrapeListingDetail(browser, listing);
+            if (!detail || detail.hasWebsite) return;
 
-          leads.push({
-            id: extractPlaceId(listing.href),
-            name: detail.name || cleanLabel(listing.label),
-            category: cleanLabel(detail.category),
-            phone: cleanLabel(detail.phone),
-            address: cleanLabel(detail.address),
-            lat: coords.lat,
-            lng: coords.lng,
-          });
+            leads.push({
+              id: extractPlaceId(listing.href),
+              name: detail.name || cleanLabel(listing.label),
+              category: cleanLabel(detail.category),
+              phone: cleanLabel(detail.phone),
+              address: cleanLabel(detail.address),
+              lat: coords.lat,
+              lng: coords.lng,
+            });
+          } catch {
+            // a single listing failing should not abort the whole search
+          }
         }),
       ),
     );

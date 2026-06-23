@@ -3,6 +3,10 @@ import express from "express";
 import cors from "cors";
 import leadsRouter from "./routes/leads.js";
 
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 4000;
 
