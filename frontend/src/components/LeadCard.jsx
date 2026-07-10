@@ -1,11 +1,14 @@
 import { Phone, MapPin, Tag } from "lucide-react";
 
-export default function LeadCard({ lead, active, onSelect }) {
+export default function LeadCard({ lead, active, onSelect, index = 0 }) {
   return (
     <button
       onClick={() => onSelect(lead)}
-      className={`w-full border-b border-line px-4 py-4 text-left transition-colors ${
-        active ? "bg-accent-dim" : "hover:bg-black/[0.02]"
+      style={{ animationDelay: `${index * 40}ms` }}
+      className={`animate-slide-in w-full border-b border-line px-4 py-4 text-left transition-colors ${
+        active
+          ? "bg-accent-dim"
+          : "bg-paper hover:bg-black/[0.02] dark:hover:bg-white/[0.03]"
       }`}
     >
       <div className="flex items-start justify-between gap-2">
@@ -29,7 +32,7 @@ export default function LeadCard({ lead, active, onSelect }) {
           </div>
         )}
         <div className="flex items-start gap-1.5">
-          <MapPin className="h-3 w-3 shrink-0 mt-0.5" />
+          <MapPin className="h-3 w-3 mt-0.5 shrink-0" />
           <span>{lead.address}</span>
         </div>
       </div>

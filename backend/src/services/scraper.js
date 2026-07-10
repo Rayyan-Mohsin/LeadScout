@@ -15,7 +15,7 @@ const CATEGORY_QUERIES = [
 
 const RESULTS_PER_CATEGORY = 8;
 const MAX_TOTAL_LEADS = 40;
-const DETAIL_CONCURRENCY = 3;
+const DETAIL_CONCURRENCY = 5;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
@@ -34,15 +34,15 @@ async function collectListingLinks(browser, query) {
     await page.setUserAgent(USER_AGENT);
 
     const url = `https://www.google.com/maps/search/${encodeURIComponent(query)}/?hl=en`;
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => null);
 
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 2; i += 1) {
       await page.evaluate(() => {
         const feed = document.querySelector('div[role="feed"]');
         if (feed) feed.scrollTop = feed.scrollHeight;
       });
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await new Promise((resolve) => setTimeout(resolve, 700));
     }
 
     const links = await page.evaluate(() =>
@@ -65,9 +65,9 @@ async function scrapeListingDetail(browser, listing) {
 
   try {
     await page.setUserAgent(USER_AGENT);
-    await page.goto(listing.href, { waitUntil: "networkidle2", timeout: 30000 });
-    await page.waitForSelector("h1", { timeout: 10000 }).catch(() => null);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector('button[data-item-id="address"], h1', { timeout: 8000 }).catch(() => null);
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
     const detail = await page.evaluate(() => {
       const name = document.querySelector("h1")?.textContent?.trim() || "";
