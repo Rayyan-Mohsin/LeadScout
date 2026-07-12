@@ -8,29 +8,22 @@ import {
 } from "react-leaflet";
 import L from "leaflet";
 
-const LIGHT_TILES = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
-const DARK_TILES =
-  "https://{s}.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}{r}.png";
-
-const LIGHT_ATTRIBUTION =
+const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+const ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
-const DARK_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>';
 
-function makeMarker(isDark) {
-  return L.divIcon({
-    className: "",
-    html: `<div style="
-      width: 13px;
-      height: 13px;
-      background: #5b9bff;
-      border: 2px solid ${isDark ? "#111" : "#fff"};
-      box-shadow: 0 0 0 1.5px #5b9bff, 0 2px 6px rgba(0,0,0,0.35);
-    "></div>`,
-    iconSize: [13, 13],
-    iconAnchor: [6, 6],
-  });
-}
+const markerIcon = L.divIcon({
+  className: "",
+  html: `<div style="
+    width: 13px;
+    height: 13px;
+    background: #5b9bff;
+    border: 2px solid #fff;
+    box-shadow: 0 0 0 1.5px #5b9bff, 0 2px 6px rgba(0,0,0,0.35);
+  "></div>`,
+  iconSize: [13, 13],
+  iconAnchor: [6, 6],
+});
 
 const DEFAULT_CENTER = [39.8283, -98.5795];
 const DEFAULT_ZOOM = 4;
@@ -43,18 +36,7 @@ function FlyToLead({ lead }) {
   return null;
 }
 
-function TileLayerSwitcher({ isDark }) {
-  const map = useMap();
-  useEffect(() => {
-    // Nothing — tile switcher handled via key on TileLayer
-    void map;
-  }, [isDark, map]);
-  return null;
-}
-
-export default function MapView({ leads, selectedLead, onSelectLead, isDark, mobileTab }) {
-  const markerIcon = makeMarker(isDark);
-
+export default function MapView({ leads, selectedLead, onSelectLead, mobileTab }) {
   return (
     <div
       className={`h-full w-full
@@ -67,13 +49,7 @@ export default function MapView({ leads, selectedLead, onSelectLead, isDark, mob
         zoomControl={false}
         className="h-full w-full"
       >
-        <TileLayer
-          key={isDark ? "dark" : "light"}
-          attribution={isDark ? DARK_ATTRIBUTION : LIGHT_ATTRIBUTION}
-          url={isDark ? DARK_TILES : LIGHT_TILES}
-        />
-
-        <TileLayerSwitcher isDark={isDark} />
+        <TileLayer attribution={ATTRIBUTION} url={TILE_URL} />
         <FlyToLead lead={selectedLead} />
 
         {leads.map((lead) => (

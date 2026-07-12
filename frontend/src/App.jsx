@@ -78,7 +78,6 @@ function App() {
             leads={leads}
             selectedLead={selectedLead}
             onSelectLead={handleSelectLead}
-            isDark={theme === "dark"}
             mobileTab={mobileTab}
           />
         </main>
