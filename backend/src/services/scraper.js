@@ -19,10 +19,24 @@ const DETAIL_CONCURRENCY = 5;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
+function getProxyArgs() {
+  const proxy =
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy;
+  return proxy ? [`--proxy-server=${proxy}`] : [];
+}
+
 function launchBrowser() {
   return puppeteer.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--ignore-certificate-errors"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--ignore-certificate-errors",
+      ...getProxyArgs(),
+    ],
   });
 }
 
@@ -94,12 +108,13 @@ async function scrapeListingDetail(browser, listing) {
 }
 
 export async function findBusinessesWithoutWebsite(location) {
-  const browser = await launchBrowser();
+  let browser;
   const limit = pLimit(DETAIL_CONCURRENCY);
   const seenPlaceIds = new Set();
   const leads = [];
 
   try {
+    browser = await launchBrowser();
     const queries = CATEGORY_QUERIES.map((category) => `${category} in ${location}`);
     const listingBatches = await Promise.all(
       queries.map((query) => collectListingLinks(browser, query)),
@@ -143,7 +158,7 @@ export async function findBusinessesWithoutWebsite(location) {
       ),
     );
   } finally {
-    await browser.close();
+    if (browser) await browser.close().catch(() => null);
   }
 
   return leads;
