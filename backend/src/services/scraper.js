@@ -1,200 +1,206 @@
+import puppeteer from "puppeteer";
 import pLimit from "p-limit";
+import {
+  extractCoordsFromHref,
+  extractPlaceId,
+  cleanLabel,
+} from "../utils/parseListing.js";
 
 const NOMINATIM_URL = "https://nominatim.openstreetmap.org";
-const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
-const DDG_HTML_URL = "https://html.duckduckgo.com/html/";
-const USER_AGENT = "LeadScout/1.0 (github.com/Rayyan-Mohsin/LeadScout)";
+const NOMINATIM_UA = "LeadScout/1.0 (github.com/Rayyan-Mohsin/LeadScout)";
+const MAPS_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 const MAX_LEADS = 40;
-const OSM_CANDIDATE_LIMIT = 100;
-const SEARCH_CONCURRENCY = 6;
-const SEARCH_TIMEOUT_MS = 6000;
+const RESULTS_PER_CATEGORY = 8;
+const DETAIL_CONCURRENCY = 4;
+const CATEGORY_CONCURRENCY = 3;
 
-const AMENITY_TYPES = [
-  "restaurant", "cafe", "bar", "fast_food", "pub",
-  "dentist", "doctors", "pharmacy",
-  "hairdresser", "beauty",
-  "gym", "fitness_centre",
+const CATEGORY_QUERIES = [
+  "restaurants",
+  "cafes",
+  "bars",
+  "bakeries",
+  "hair salons",
+  "barber shops",
+  "beauty salons",
+  "auto repair shops",
+  "dentists",
+  "gyms",
+  "pharmacies",
+  "clothing stores",
 ];
-const SHOP_TYPES = [
-  "hairdresser", "beauty", "car_repair", "clothes",
-  "electronics", "hardware", "bakery", "butcher",
-];
 
-// Sites that aggregate or list businesses — appearing here does NOT mean
-// the business has its own website
-const DIRECTORY_HOSTS = new Set([
-  "yelp.com", "tripadvisor.com", "yellowpages.com", "whitepages.com",
-  "superpages.com", "dexknows.com", "manta.com", "chamberofcommerce.com",
-  "bbb.org", "angieslist.com", "angi.com", "homeadvisor.com", "thumbtack.com",
-  "houzz.com", "nextdoor.com",
-  "facebook.com", "instagram.com", "twitter.com", "x.com", "tiktok.com",
-  "linkedin.com", "pinterest.com",
-  "google.com", "maps.google.com", "bing.com", "yahoo.com",
-  "apple.com", "maps.apple.com",
-  "foursquare.com", "mapquest.com", "waze.com",
-  "doordash.com", "ubereats.com", "grubhub.com", "seamless.com",
-  "postmates.com", "caviar.com",
-  "opentable.com", "resy.com", "zomato.com", "allmenus.com", "menupages.com",
-  "menuswithprice.com", "sirved.com", "locu.com",
-  "healthgrades.com", "zocdoc.com", "vitals.com", "webmd.com", "ratemds.com",
-  "groupon.com", "livingsocial.com",
-  "alignable.com", "merchantcircle.com", "citysearch.com",
-  "mystore411.com", "storelocatorplus.com", "findglocal.com",
-  "local.com", "n49.com", "cylex.us", "hotfrog.com",
-  "mapquest.com", "brownbook.net", "showmelocal.com",
-  "ezlocal.com", "tupalo.com", "place.tips",
-]);
+// Resolve a user-supplied location (city name or US zip) to a clean string
+// that Google Maps recognises well.
+async function resolveLocation(location) {
+  const isUsZip = /^\d{5}$/.test(location.trim());
+  const query = isUsZip ? `${location}, USA` : location;
+  try {
+    const resp = await fetch(
+      `${NOMINATIM_URL}/search?q=${encodeURIComponent(query)}&format=json&limit=1&addressdetails=1`,
+      { headers: { "User-Agent": NOMINATIM_UA } },
+    );
+    if (!resp.ok) return location;
+    const [result] = await resp.json();
+    if (!result) return location;
+    const a = result.address || {};
+    const city = a.city || a.town || a.village || a.county || "";
+    const region = a.state || a.country || "";
+    return city && region ? `${city}, ${region}` : location;
+  } catch {
+    return location;
+  }
+}
 
-function apiFetch(url, options = {}) {
-  return fetch(url, {
-    ...options,
-    headers: { "User-Agent": USER_AGENT, ...options.headers },
+function launchBrowser() {
+  return puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-extensions",
+      "--no-first-run",
+    ],
   });
 }
 
-async function geocode(location) {
-  const isUsZip = /^\d{5}$/.test(location.trim());
-  const query = isUsZip ? `${location}, USA` : location;
-  const url = `${NOMINATIM_URL}/search?q=${encodeURIComponent(query)}&format=json&limit=5&addressdetails=0`;
-  const resp = await apiFetch(url);
-  if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
-  const results = await resp.json();
-
-  const place =
-    results.find(
-      (r) => r.boundingbox && (r.class === "boundary" || r.class === "place" || r.type === "administrative"),
-    ) || results[0];
-
-  if (!place) throw new Error(`Location not found: ${location}`);
-
-  const [minLat, maxLat, minLon, maxLon] = place.boundingbox.map(Number);
-  return { minLat, maxLat, minLon, maxLon };
-}
-
-function buildOverpassQuery(bbox) {
-  const { minLat, maxLat, minLon, maxLon } = bbox;
-  const b = `${minLat},${minLon},${maxLat},${maxLon}`;
-  const amenityFilter = AMENITY_TYPES.join("|");
-  const shopFilter = SHOP_TYPES.join("|");
-
-  // Exclude anything that already signals a web presence in OSM
-  return `
-[out:json][timeout:45];
-(
-  node["amenity"~"^(${amenityFilter})$"]["name"][!"website"][!"contact:website"][!"url"][!"brand"](${b});
-  way["amenity"~"^(${amenityFilter})$"]["name"][!"website"][!"contact:website"][!"url"][!"brand"](${b});
-  node["shop"~"^(${shopFilter})$"]["name"][!"website"][!"contact:website"][!"url"][!"brand"](${b});
-  way["shop"~"^(${shopFilter})$"]["name"][!"website"][!"contact:website"][!"url"][!"brand"](${b});
-  node["leisure"="fitness_centre"]["name"][!"website"][!"contact:website"][!"url"][!"brand"](${b});
-);
-out center ${OSM_CANDIDATE_LIMIT};
-`.trim();
-}
-
-function formatAddress(tags) {
-  const parts = [
-    tags["addr:housenumber"] && tags["addr:street"]
-      ? `${tags["addr:housenumber"]} ${tags["addr:street"]}`
-      : tags["addr:street"],
-    tags["addr:city"],
-    tags["addr:state"],
-    tags["addr:postcode"],
-  ].filter(Boolean);
-  return parts.join(", ") || null;
-}
-
-function mapCategory(tags) {
-  const raw = tags.amenity || tags.shop || tags.leisure || "";
-  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || null;
-}
-
-// Search DuckDuckGo for "{name} {location}" and check whether any of the
-// top results is an official business website (not a directory listing).
-async function hasOfficialWebsite(name, location) {
-  const q = `"${name}" ${location}`;
+// Open Google Maps search for one category and return listing hrefs + labels.
+async function collectListings(browser, resolvedLocation, category) {
+  const page = await browser.newPage();
   try {
-    const resp = await fetch(DDG_HTML_URL, {
-      method: "POST",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      body: `q=${encodeURIComponent(q)}&kl=us-en`,
-      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-    });
+    await page.setUserAgent(MAPS_UA);
+    await page.setViewport({ width: 1366, height: 900 });
 
-    if (!resp.ok) return false;
+    const query = `${category} in ${resolvedLocation}`;
+    await page.goto(
+      `https://www.google.com/maps/search/${encodeURIComponent(query)}/?hl=en`,
+      { waitUntil: "domcontentloaded", timeout: 45000 },
+    );
 
-    const html = await resp.text();
+    // Wait for the results feed, then scroll to surface more listings
+    await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => null);
 
-    // DuckDuckGo HTML result links: <a class="result__url" href="https://...">
-    const pattern = /<a[^>]+class="result__url"[^>]+href="([^"]+)"/g;
-    let match;
-    let checked = 0;
-
-    while ((match = pattern.exec(html)) !== null && checked < 5) {
-      checked++;
-      try {
-        const host = new URL(match[1]).hostname.toLowerCase().replace(/^www\./, "");
-        if (host && !DIRECTORY_HOSTS.has(host)) return true;
-      } catch {
-        // skip malformed URLs
-      }
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => {
+        const feed = document.querySelector('div[role="feed"]');
+        if (feed) feed.scrollTop = feed.scrollHeight;
+      });
+      await new Promise((r) => setTimeout(r, 800));
     }
 
-    return false;
+    const links = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('div[role="feed"] a.hfpxzc')).map((a) => ({
+        href: a.getAttribute("href") || "",
+        label: a.getAttribute("aria-label") || "",
+      })),
+    );
+
+    return links.filter((l) => l.href).slice(0, RESULTS_PER_CATEGORY);
   } catch {
-    return false;
+    return [];
+  } finally {
+    await page.close().catch(() => null);
+  }
+}
+
+// Visit a single Google Maps listing and return lead data, or null if it has a website.
+async function scrapeListing(browser, listing) {
+  const page = await browser.newPage();
+  try {
+    await page.setUserAgent(MAPS_UA);
+    await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector("h1", { timeout: 10000 }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const coords = extractCoordsFromHref(page.url());
+    if (!coords) return null;
+
+    const detail = await page.evaluate(() => {
+      // If the business has a "Website" button, it's not a lead — skip it
+      if (document.querySelector('a[data-item-id="authority"]')) return null;
+
+      const name = document.querySelector("h1")?.textContent?.trim();
+      if (!name) return null;
+
+      // Category sits in the first button below the rating row
+      const categoryEl =
+        document.querySelector('button[jsaction*="pane.rating.category"]') ||
+        document.querySelector("button.DkEaL");
+      const addressEl = document.querySelector('button[data-item-id="address"]');
+      const phoneEl = document.querySelector('button[data-item-id^="phone"]');
+
+      return {
+        name,
+        category: categoryEl?.textContent?.trim() || null,
+        address: addressEl?.getAttribute("aria-label") || null,
+        phone: phoneEl?.getAttribute("aria-label") || null,
+      };
+    });
+
+    if (!detail) return null;
+
+    return {
+      name: detail.name,
+      category: cleanLabel(detail.category),
+      address: cleanLabel(detail.address),
+      phone: cleanLabel(detail.phone),
+      lat: coords.lat,
+      lng: coords.lng,
+    };
+  } catch {
+    return null;
+  } finally {
+    await page.close().catch(() => null);
   }
 }
 
 export async function findBusinessesWithoutWebsite(location) {
-  const bbox = await geocode(location);
+  const resolvedLocation = await resolveLocation(location);
+  const browser = await launchBrowser();
 
-  const query = buildOverpassQuery(bbox);
-  const resp = await apiFetch(OVERPASS_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `data=${encodeURIComponent(query)}`,
-  });
+  try {
+    // Collect unique listings across all categories (parallel, bounded concurrency)
+    const catLimit = pLimit(CATEGORY_CONCURRENCY);
+    const batches = await Promise.all(
+      CATEGORY_QUERIES.map((category) =>
+        catLimit(() => collectListings(browser, resolvedLocation, category)),
+      ),
+    );
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Overpass error ${resp.status}: ${text.substring(0, 200)}`);
+    const seenIds = new Set();
+    const allListings = [];
+    for (const batch of batches) {
+      for (const listing of batch) {
+        const id = extractPlaceId(listing.href);
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        allListings.push({ ...listing, id });
+      }
+    }
+
+    // Visit each listing to check for a website, with bounded concurrency
+    const detailLimit = pLimit(DETAIL_CONCURRENCY);
+    const leads = [];
+
+    await Promise.all(
+      allListings.map((listing) =>
+        detailLimit(async () => {
+          if (leads.length >= MAX_LEADS) return;
+          const result = await scrapeListing(browser, listing);
+          if (result && leads.length < MAX_LEADS) {
+            leads.push({ id: listing.id, ...result });
+          }
+        }),
+      ),
+    );
+
+    return leads;
+  } finally {
+    await browser.close().catch(() => null);
   }
-
-  const data = await resp.json();
-
-  const candidates = (data.elements || []).filter(
-    (el) => el.tags?.name && (el.lat != null || el.center),
-  );
-
-  const limit = pLimit(SEARCH_CONCURRENCY);
-
-  const checked = await Promise.all(
-    candidates.map((el) =>
-      limit(async () => {
-        const hasWebsite = await hasOfficialWebsite(el.tags.name, location);
-        return hasWebsite ? null : el;
-      }),
-    ),
-  );
-
-  return checked
-    .filter(Boolean)
-    .slice(0, MAX_LEADS)
-    .map((el) => {
-      const lat = el.lat ?? el.center?.lat;
-      const lon = el.lon ?? el.center?.lon;
-      return {
-        id: `${el.type}/${el.id}`,
-        name: el.tags.name,
-        category: mapCategory(el.tags),
-        phone: el.tags.phone || el.tags["contact:phone"] || null,
-        address: formatAddress(el.tags),
-        lat,
-        lng: lon,
-      };
-    });
 }
