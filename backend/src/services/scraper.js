@@ -31,8 +31,6 @@ const CATEGORY_QUERIES = [
   "clothing stores",
 ];
 
-// Resolve a user-supplied location (city name or US zip) to a clean string
-// that Google Maps recognises well.
 async function resolveLocation(location) {
   const isUsZip = /^\d{5}$/.test(location.trim());
   const query = isUsZip ? `${location}, USA` : location;
@@ -69,28 +67,60 @@ function launchBrowser() {
   });
 }
 
-// Open Google Maps search for one category and return listing hrefs + labels.
+// Route all of Chromium's network requests through Node's fetch, which
+// transparently uses HTTPS_PROXY and works in this container environment.
+async function enableInterception(page) {
+  await page.setRequestInterception(true);
+  page.on("request", async (req) => {
+    const url = req.url();
+    if (!url.startsWith("http")) {
+      await req.continue().catch(() => {});
+      return;
+    }
+    try {
+      const init = {
+        method: req.method(),
+        headers: { ...req.headers(), "User-Agent": MAPS_UA },
+        redirect: "follow",
+      };
+      const body = req.postData();
+      if (body) init.body = body;
+
+      const resp = await fetch(url, init);
+      const buffer = await resp.arrayBuffer();
+      const headers = {};
+      resp.headers.forEach((v, k) => {
+        // Drop content-encoding — the body is already decoded by fetch
+        if (k !== "content-encoding") headers[k] = v;
+      });
+      await req.respond({ status: resp.status, headers, body: Buffer.from(buffer) });
+    } catch {
+      await req.abort("failed").catch(() => {});
+    }
+  });
+}
+
 async function collectListings(browser, resolvedLocation, category) {
   const page = await browser.newPage();
   try {
     await page.setUserAgent(MAPS_UA);
     await page.setViewport({ width: 1366, height: 900 });
+    await enableInterception(page);
 
     const query = `${category} in ${resolvedLocation}`;
     await page.goto(
       `https://www.google.com/maps/search/${encodeURIComponent(query)}/?hl=en`,
-      { waitUntil: "domcontentloaded", timeout: 45000 },
+      { waitUntil: "domcontentloaded", timeout: 60000 },
     );
 
-    // Wait for the results feed, then scroll to surface more listings
-    await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => null);
+    await page.waitForSelector('div[role="feed"]', { timeout: 20000 }).catch(() => null);
 
     for (let i = 0; i < 3; i++) {
       await page.evaluate(() => {
         const feed = document.querySelector('div[role="feed"]');
         if (feed) feed.scrollTop = feed.scrollHeight;
       });
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 1000));
     }
 
     const links = await page.evaluate(() =>
@@ -108,26 +138,25 @@ async function collectListings(browser, resolvedLocation, category) {
   }
 }
 
-// Visit a single Google Maps listing and return lead data, or null if it has a website.
 async function scrapeListing(browser, listing) {
   const page = await browser.newPage();
   try {
     await page.setUserAgent(MAPS_UA);
-    await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForSelector("h1", { timeout: 10000 }).catch(() => null);
-    await new Promise((r) => setTimeout(r, 500));
+    await enableInterception(page);
+
+    await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForSelector("h1", { timeout: 15000 }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 800));
 
     const coords = extractCoordsFromHref(page.url());
     if (!coords) return null;
 
     const detail = await page.evaluate(() => {
-      // If the business has a "Website" button, it's not a lead — skip it
       if (document.querySelector('a[data-item-id="authority"]')) return null;
 
       const name = document.querySelector("h1")?.textContent?.trim();
       if (!name) return null;
 
-      // Category sits in the first button below the rating row
       const categoryEl =
         document.querySelector('button[jsaction*="pane.rating.category"]') ||
         document.querySelector("button.DkEaL");
@@ -161,10 +190,10 @@ async function scrapeListing(browser, listing) {
 
 export async function findBusinessesWithoutWebsite(location) {
   const resolvedLocation = await resolveLocation(location);
-  const browser = await launchBrowser();
-
+  let browser;
   try {
-    // Collect unique listings across all categories (parallel, bounded concurrency)
+    browser = await launchBrowser();
+
     const catLimit = pLimit(CATEGORY_CONCURRENCY);
     const batches = await Promise.all(
       CATEGORY_QUERIES.map((category) =>
@@ -183,7 +212,6 @@ export async function findBusinessesWithoutWebsite(location) {
       }
     }
 
-    // Visit each listing to check for a website, with bounded concurrency
     const detailLimit = pLimit(DETAIL_CONCURRENCY);
     const leads = [];
 
@@ -201,6 +229,6 @@ export async function findBusinessesWithoutWebsite(location) {
 
     return leads;
   } finally {
-    await browser.close().catch(() => null);
+    if (browser) await browser.close().catch(() => null);
   }
 }
