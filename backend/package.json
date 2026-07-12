@@ -1,7 +1,7 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "API that finds local businesses without a website using Google Places API",
+  "description": "API that finds local businesses without a website using OpenStreetMap + DuckDuckGo",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "p-limit": "^7.3.0"
   }
 }
