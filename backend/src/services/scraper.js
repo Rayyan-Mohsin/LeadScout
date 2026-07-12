@@ -1,175 +1,113 @@
-import puppeteer from "puppeteer";
 import pLimit from "p-limit";
-import { extractCoordsFromHref, extractPlaceId, cleanLabel } from "../utils/parseListing.js";
 
-const CATEGORY_QUERIES = [
-  "restaurants",
-  "cafes",
-  "hair salons",
-  "auto repair shops",
-  "retail stores",
-  "contractors",
-  "dentists",
-  "gyms",
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org";
+const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+const USER_AGENT = "LeadScout/1.0 (github.com/Rayyan-Mohsin/LeadScout)";
+const MAX_LEADS = 40;
+
+const AMENITY_TYPES = [
+  "restaurant", "cafe", "bar", "fast_food", "pub",
+  "dentist", "doctors", "pharmacy",
+  "hairdresser", "beauty",
+  "gym", "fitness_centre",
+];
+const SHOP_TYPES = [
+  "hairdresser", "beauty", "car_repair", "clothes",
+  "electronics", "hardware", "bakery", "butcher",
 ];
 
-const RESULTS_PER_CATEGORY = 8;
-const MAX_TOTAL_LEADS = 40;
-const FEED_CONCURRENCY = 3;
-const DETAIL_CONCURRENCY = 4;
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-
-const LAUNCH_ARGS = [
-  "--no-sandbox",
-  "--disable-setuid-sandbox",
-  "--disable-dev-shm-usage",
-  "--disable-gpu",
-  "--disable-background-networking",
-  "--ignore-certificate-errors",
-  "--proxy-server=direct://",
-];
-
-function launchBrowser() {
-  return puppeteer.launch({ headless: true, args: LAUNCH_ARGS });
+function apiFetch(url, options = {}) {
+  return fetch(url, {
+    ...options,
+    headers: { "User-Agent": USER_AGENT, ...options.headers },
+  });
 }
 
-export async function verifyBrowserLaunch() {
-  let browser;
-  try {
-    browser = await launchBrowser();
-    await browser.close();
-    return true;
-  } catch (err) {
-    console.error("[leadscout] Chromium launch check failed:", err.message);
-    console.error("[leadscout] Run: cd backend && npx puppeteer browsers install chrome");
-    return false;
-  }
+async function geocode(location) {
+  const isUsZip = /^\d{5}$/.test(location.trim());
+  const query = isUsZip ? `${location}, USA` : location;
+  const url = `${NOMINATIM_URL}/search?q=${encodeURIComponent(query)}&format=json&limit=5&addressdetails=0`;
+  const resp = await apiFetch(url);
+  if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
+  const results = await resp.json();
+
+  const place = results.find(
+    (r) => r.boundingbox && (r.class === "boundary" || r.class === "place" || r.type === "administrative"),
+  ) || results[0];
+
+  if (!place) throw new Error(`Location not found: ${location}`);
+
+  const [minLat, maxLat, minLon, maxLon] = place.boundingbox.map(Number);
+  return { minLat, maxLat, minLon, maxLon, displayName: place.display_name };
 }
 
-async function collectListingLinks(browser, query) {
-  const page = await browser.newPage();
+function buildOverpassQuery(bbox) {
+  const { minLat, maxLat, minLon, maxLon } = bbox;
+  const b = `${minLat},${minLon},${maxLat},${maxLon}`;
+  const amenityFilter = AMENITY_TYPES.join("|");
+  const shopFilter = SHOP_TYPES.join("|");
 
-  try {
-    await page.setViewport({ width: 1366, height: 900 });
-    await page.setUserAgent(USER_AGENT);
-
-    const url = `https://www.google.com/maps/search/${encodeURIComponent(query)}/?hl=en`;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => null);
-
-    for (let i = 0; i < 2; i += 1) {
-      await page.evaluate(() => {
-        const feed = document.querySelector('div[role="feed"]');
-        if (feed) feed.scrollTop = feed.scrollHeight;
-      });
-      await new Promise((resolve) => setTimeout(resolve, 700));
-    }
-
-    const links = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('div[role="feed"] a.hfpxzc')).map((a) => ({
-        href: a.getAttribute("href"),
-        label: a.getAttribute("aria-label"),
-      })),
-    );
-
-    return links.filter((link) => link.href).slice(0, RESULTS_PER_CATEGORY);
-  } catch {
-    return [];
-  } finally {
-    await page.close().catch(() => null);
-  }
+  return `
+[out:json][timeout:45];
+(
+  node["amenity"~"^(${amenityFilter})$"]["name"][!"website"][!"brand"](${b});
+  way["amenity"~"^(${amenityFilter})$"]["name"][!"website"][!"brand"](${b});
+  node["shop"~"^(${shopFilter})$"]["name"][!"website"][!"brand"](${b});
+  way["shop"~"^(${shopFilter})$"]["name"][!"website"][!"brand"](${b});
+  node["leisure"="fitness_centre"]["name"][!"website"][!"brand"](${b});
+);
+out center ${MAX_LEADS};
+`.trim();
 }
 
-async function scrapeListingDetail(browser, listing) {
-  const page = await browser.newPage();
+function formatAddress(tags) {
+  const parts = [
+    tags["addr:housenumber"] && tags["addr:street"]
+      ? `${tags["addr:housenumber"]} ${tags["addr:street"]}`
+      : tags["addr:street"],
+    tags["addr:city"],
+    tags["addr:state"],
+    tags["addr:postcode"],
+  ].filter(Boolean);
+  return parts.join(", ") || null;
+}
 
-  try {
-    await page.setUserAgent(USER_AGENT);
-    await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForSelector('button[data-item-id="address"], h1', { timeout: 8000 }).catch(() => null);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    const detail = await page.evaluate(() => {
-      const name = document.querySelector("h1")?.textContent?.trim() || "";
-      const category = document.querySelector('button[jsaction*="category"]')?.textContent?.trim();
-      const addressEl = document.querySelector('button[data-item-id="address"]');
-      const phoneEl = document.querySelector('button[data-item-id^="phone"]');
-      const websiteEl = document.querySelector('a[data-item-id="authority"]');
-
-      return {
-        name,
-        category: category || null,
-        address: addressEl?.getAttribute("aria-label") || null,
-        phone: phoneEl?.getAttribute("aria-label") || null,
-        hasWebsite: !!websiteEl,
-      };
-    });
-
-    return detail;
-  } catch {
-    return null;
-  } finally {
-    await page.close().catch(() => null);
-  }
+function mapCategory(tags) {
+  const raw = tags.amenity || tags.shop || tags.leisure || "";
+  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || null;
 }
 
 export async function findBusinessesWithoutWebsite(location) {
-  let browser;
-  const feedLimit = pLimit(FEED_CONCURRENCY);
-  const detailLimit = pLimit(DETAIL_CONCURRENCY);
-  const seenPlaceIds = new Set();
-  const leads = [];
+  const bbox = await geocode(location);
 
-  try {
-    browser = await launchBrowser();
+  const query = buildOverpassQuery(bbox);
+  const resp = await apiFetch(OVERPASS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `data=${encodeURIComponent(query)}`,
+  });
 
-    const queries = CATEGORY_QUERIES.map((category) => `${category} in ${location}`);
-
-    const listingBatches = await Promise.all(
-      queries.map((query) => feedLimit(() => collectListingLinks(browser, query))),
-    );
-
-    const uniqueListings = [];
-    for (const batch of listingBatches) {
-      for (const listing of batch) {
-        const placeId = extractPlaceId(listing.href);
-        if (seenPlaceIds.has(placeId)) continue;
-        seenPlaceIds.add(placeId);
-        uniqueListings.push(listing);
-      }
-    }
-
-    await Promise.all(
-      uniqueListings.map((listing) =>
-        detailLimit(async () => {
-          try {
-            if (leads.length >= MAX_TOTAL_LEADS) return;
-
-            const coords = extractCoordsFromHref(listing.href);
-            if (!coords) return;
-
-            const detail = await scrapeListingDetail(browser, listing);
-            if (!detail || detail.hasWebsite) return;
-
-            leads.push({
-              id: extractPlaceId(listing.href),
-              name: detail.name || cleanLabel(listing.label),
-              category: cleanLabel(detail.category),
-              phone: cleanLabel(detail.phone),
-              address: cleanLabel(detail.address),
-              lat: coords.lat,
-              lng: coords.lng,
-            });
-          } catch {
-            // single listing failure should not abort the whole search
-          }
-        }),
-      ),
-    );
-  } finally {
-    if (browser) await browser.close().catch(() => null);
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Overpass error ${resp.status}: ${text.substring(0, 200)}`);
   }
 
-  return leads;
+  const data = await resp.json();
+
+  return (data.elements || [])
+    .filter((el) => el.tags?.name && (el.lat != null || el.center))
+    .slice(0, MAX_LEADS)
+    .map((el) => {
+      const lat = el.lat ?? el.center?.lat;
+      const lon = el.lon ?? el.center?.lon;
+      return {
+        id: `${el.type}/${el.id}`,
+        name: el.tags.name,
+        category: mapCategory(el.tags),
+        phone: el.tags.phone || el.tags["contact:phone"] || null,
+        address: formatAddress(el.tags),
+        lat,
+        lng: lon,
+      };
+    });
 }
