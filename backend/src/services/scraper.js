@@ -15,20 +15,36 @@ const CATEGORY_QUERIES = [
 
 const RESULTS_PER_CATEGORY = 8;
 const MAX_TOTAL_LEADS = 40;
-const DETAIL_CONCURRENCY = 5;
+const FEED_CONCURRENCY = 3;
+const DETAIL_CONCURRENCY = 4;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
+const LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-background-networking",
+  "--ignore-certificate-errors",
+  "--proxy-server=direct://",
+];
+
 function launchBrowser() {
-  return puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--ignore-certificate-errors",
-      "--proxy-server=direct://",
-    ],
-  });
+  return puppeteer.launch({ headless: true, args: LAUNCH_ARGS });
+}
+
+export async function verifyBrowserLaunch() {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    await browser.close();
+    return true;
+  } catch (err) {
+    console.error("[leadscout] Chromium launch check failed:", err.message);
+    console.error("[leadscout] Run: cd backend && npx puppeteer browsers install chrome");
+    return false;
+  }
 }
 
 async function collectListingLinks(browser, query) {
@@ -100,15 +116,18 @@ async function scrapeListingDetail(browser, listing) {
 
 export async function findBusinessesWithoutWebsite(location) {
   let browser;
-  const limit = pLimit(DETAIL_CONCURRENCY);
+  const feedLimit = pLimit(FEED_CONCURRENCY);
+  const detailLimit = pLimit(DETAIL_CONCURRENCY);
   const seenPlaceIds = new Set();
   const leads = [];
 
   try {
     browser = await launchBrowser();
+
     const queries = CATEGORY_QUERIES.map((category) => `${category} in ${location}`);
+
     const listingBatches = await Promise.all(
-      queries.map((query) => collectListingLinks(browser, query)),
+      queries.map((query) => feedLimit(() => collectListingLinks(browser, query))),
     );
 
     const uniqueListings = [];
@@ -123,7 +142,7 @@ export async function findBusinessesWithoutWebsite(location) {
 
     await Promise.all(
       uniqueListings.map((listing) =>
-        limit(async () => {
+        detailLimit(async () => {
           try {
             if (leads.length >= MAX_TOTAL_LEADS) return;
 
@@ -143,7 +162,7 @@ export async function findBusinessesWithoutWebsite(location) {
               lng: coords.lng,
             });
           } catch {
-            // a single listing failing should not abort the whole search
+            // single listing failure should not abort the whole search
           }
         }),
       ),
