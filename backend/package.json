@@ -1,18 +1,19 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "API that finds local businesses without a website using OpenStreetMap + DuckDuckGo",
+  "description": "API that finds local businesses without a website by scraping Google Maps",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
-    "start": "NODE_USE_ENV_PROXY=1 node src/server.js",
-    "dev": "NODE_USE_ENV_PROXY=1 node --watch src/server.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
   },
   "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "p-limit": "^7.3.0"
+    "p-limit": "^7.3.0",
+    "puppeteer": "^25.3.0"
   }
 }
