@@ -12,24 +12,29 @@ const MAPS_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const MAX_LEADS = 40;
-const RESULTS_PER_CATEGORY = 8;
-const DETAIL_CONCURRENCY = 4;
-const CATEGORY_CONCURRENCY = 3;
+const RESULTS_PER_CATEGORY = 5;
+const DETAIL_CONCURRENCY = 12;
+const CATEGORY_CONCURRENCY = 6;
 
 const CATEGORY_QUERIES = [
   "restaurants",
   "cafes",
   "bars",
-  "bakeries",
   "hair salons",
   "barber shops",
   "beauty salons",
   "auto repair shops",
   "dentists",
   "gyms",
-  "pharmacies",
   "clothing stores",
 ];
+
+// Types we never need — aborting them saves bandwidth and time.
+const ABORT_TYPES = new Set(["image", "font", "media"]);
+
+// Cacheable resource types (JS bundles, CSS) are fetched once and reused.
+// Dynamic API calls (XHR/fetch) and documents are always live.
+const CACHE_TYPES = new Set(["script", "stylesheet"]);
 
 async function resolveLocation(location) {
   const isUsZip = /^\d{5}$/.test(location.trim());
@@ -67,45 +72,76 @@ function launchBrowser() {
   });
 }
 
-// Route all of Chromium's network requests through Node's fetch, which
-// transparently uses HTTPS_PROXY and works in this container environment.
-async function enableInterception(page) {
-  await page.setRequestInterception(true);
+// Route Chromium's requests through Node fetch (works through HTTPS_PROXY).
+// Images/fonts are aborted (not needed for DOM scraping).
+// Scripts/stylesheets are cached — Google Maps bundles are shared across pages.
+function enableInterception(page, cache) {
+  const inFlight = new Map(); // URL → pending Promise for dedup
+
+  page.setRequestInterception(true);
   page.on("request", async (req) => {
     const url = req.url();
     if (!url.startsWith("http")) {
       await req.continue().catch(() => {});
       return;
     }
-    try {
-      const init = {
-        method: req.method(),
-        headers: { ...req.headers(), "User-Agent": MAPS_UA },
-        redirect: "follow",
-      };
-      const body = req.postData();
-      if (body) init.body = body;
-
-      const resp = await fetch(url, init);
-      const buffer = await resp.arrayBuffer();
-      const headers = {};
-      resp.headers.forEach((v, k) => {
-        // Drop content-encoding — the body is already decoded by fetch
-        if (k !== "content-encoding") headers[k] = v;
-      });
-      await req.respond({ status: resp.status, headers, body: Buffer.from(buffer) });
-    } catch {
-      await req.abort("failed").catch(() => {});
+    if (ABORT_TYPES.has(req.resourceType())) {
+      await req.abort().catch(() => {});
+      return;
     }
+
+    const cacheKey = CACHE_TYPES.has(req.resourceType()) ? url : null;
+
+    // Return cached response immediately
+    if (cacheKey && cache.has(cacheKey)) {
+      await req.respond(cache.get(cacheKey)).catch(() => {});
+      return;
+    }
+
+    // Deduplicate concurrent in-flight fetches for the same URL
+    if (cacheKey && inFlight.has(cacheKey)) {
+      const cached = await inFlight.get(cacheKey).catch(() => null);
+      if (cached) { await req.respond(cached).catch(() => {}); return; }
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        const init = {
+          method: req.method(),
+          headers: { ...req.headers(), "User-Agent": MAPS_UA },
+          redirect: "follow",
+        };
+        const body = req.postData();
+        if (body) init.body = body;
+
+        const resp = await fetch(url, init);
+        const buffer = await resp.arrayBuffer();
+        const headers = {};
+        resp.headers.forEach((v, k) => {
+          if (k !== "content-encoding") headers[k] = v;
+        });
+        const entry = { status: resp.status, headers, body: Buffer.from(buffer) };
+        if (cacheKey) cache.set(cacheKey, entry);
+        await req.respond(entry).catch(() => {});
+        return entry;
+      } catch {
+        await req.abort("failed").catch(() => {});
+        return null;
+      }
+    })();
+
+    if (cacheKey) inFlight.set(cacheKey, fetchPromise);
+    await fetchPromise;
+    if (cacheKey) inFlight.delete(cacheKey);
   });
 }
 
-async function collectListings(browser, resolvedLocation, category) {
+async function collectListings(browser, cache, resolvedLocation, category) {
   const page = await browser.newPage();
   try {
     await page.setUserAgent(MAPS_UA);
     await page.setViewport({ width: 1366, height: 900 });
-    await enableInterception(page);
+    enableInterception(page, cache);
 
     const query = `${category} in ${resolvedLocation}`;
     await page.goto(
@@ -113,14 +149,14 @@ async function collectListings(browser, resolvedLocation, category) {
       { waitUntil: "domcontentloaded", timeout: 60000 },
     );
 
-    await page.waitForSelector('div[role="feed"]', { timeout: 20000 }).catch(() => null);
+    await page.waitForSelector('div[role="feed"]', { timeout: 15000 }).catch(() => null);
 
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 2; i++) {
       await page.evaluate(() => {
         const feed = document.querySelector('div[role="feed"]');
         if (feed) feed.scrollTop = feed.scrollHeight;
       });
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 500));
     }
 
     const links = await page.evaluate(() =>
@@ -138,15 +174,15 @@ async function collectListings(browser, resolvedLocation, category) {
   }
 }
 
-async function scrapeListing(browser, listing) {
+async function scrapeListing(browser, cache, listing) {
   const page = await browser.newPage();
   try {
     await page.setUserAgent(MAPS_UA);
-    await enableInterception(page);
+    enableInterception(page, cache);
 
     await page.goto(listing.href, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForSelector("h1", { timeout: 15000 }).catch(() => null);
-    await new Promise((r) => setTimeout(r, 800));
+    await page.waitForSelector("h1", { timeout: 10000 }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 400));
 
     const coords = extractCoordsFromHref(page.url());
     if (!coords) return null;
@@ -190,6 +226,7 @@ async function scrapeListing(browser, listing) {
 
 export async function findBusinessesWithoutWebsite(location) {
   const resolvedLocation = await resolveLocation(location);
+  const cache = new Map(); // shared script/stylesheet cache across all pages
   let browser;
   try {
     browser = await launchBrowser();
@@ -197,7 +234,7 @@ export async function findBusinessesWithoutWebsite(location) {
     const catLimit = pLimit(CATEGORY_CONCURRENCY);
     const batches = await Promise.all(
       CATEGORY_QUERIES.map((category) =>
-        catLimit(() => collectListings(browser, resolvedLocation, category)),
+        catLimit(() => collectListings(browser, cache, resolvedLocation, category)),
       ),
     );
 
@@ -219,7 +256,7 @@ export async function findBusinessesWithoutWebsite(location) {
       allListings.map((listing) =>
         detailLimit(async () => {
           if (leads.length >= MAX_LEADS) return;
-          const result = await scrapeListing(browser, listing);
+          const result = await scrapeListing(browser, cache, listing);
           if (result && leads.length < MAX_LEADS) {
             leads.push({ id: listing.id, ...result });
           }
