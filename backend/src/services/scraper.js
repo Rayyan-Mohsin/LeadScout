@@ -19,15 +19,6 @@ const DETAIL_CONCURRENCY = 5;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-function getProxyArgs() {
-  const proxy =
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy;
-  return proxy ? [`--proxy-server=${proxy}`] : [];
-}
-
 function launchBrowser() {
   return puppeteer.launch({
     headless: true,
@@ -35,7 +26,7 @@ function launchBrowser() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--ignore-certificate-errors",
-      ...getProxyArgs(),
+      "--proxy-server=direct://",
     ],
   });
 }
